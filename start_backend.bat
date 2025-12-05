@@ -1,0 +1,6 @@
+@echo off
+echo Starting FraudNets Backend...
+cd /d "%~dp0backend"
+call .\venv\Scripts\activate
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+pause
