@@ -14,6 +14,11 @@ import Toast from './components/Toast';
 
 const API_URL = 'https://fraudnets.onrender.com';
 
+const api = axios.create({
+  baseURL: API_URL,
+  timeout: 60000
+});
+
 const PATTERN_SEQUENCE = ['normal', 'cycle', 'smurf', 'structuring', 'normal', 'gnn_trigger'];
 
 function App() {
@@ -169,11 +174,11 @@ function App() {
       const currentPattern = PATTERN_SEQUENCE[patternIndex % PATTERN_SEQUENCE.length];
       setPatternIndex(prev => prev + 1);
 
-      const sampleRes = await axios.post(`${API_URL}/demo/generate-sample?pattern=${currentPattern}`);
+      const sampleRes = await api.post(`/demo/generate-sample?pattern=${currentPattern}`);
       const txs = sampleRes.data.transactions;
       const pattern = sampleRes.data.pattern;
 
-      const analyzeRes = await axios.post(`${API_URL}/analyze`, {
+      const analyzeRes = await api.post(`/analyze`, {
         transactions: txs,
         bank_id: user?.sessionId || "DEMO_BANK",
         expected_pattern: pattern
