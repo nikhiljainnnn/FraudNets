@@ -14,11 +14,14 @@ import Toast from './components/Toast';
 
 const API_URL = 'https://fraudnets.onrender.com';
 
+const PATTERN_SEQUENCE = ['normal', 'cycle', 'smurf', 'structuring', 'normal', 'gnn_trigger'];
+
 function App() {
   const { theme, toggleTheme, settings } = useTheme();
   const [showSettings, setShowSettings] = useState(false);
   const [user, setUser] = useState(null);
   const [toast, setToast] = useState(null);
+  const [patternIndex, setPatternIndex] = useState(0);
 
   const [stats, setStats] = useState({
     total_analyses: 0,
@@ -31,6 +34,7 @@ function App() {
   const [graphData, setGraphData] = useState({ nodes: [], links: [] });
   const [isSimulating, setIsSimulating] = useState(false);
   const [alerts, setAlerts] = useState([]);
+  const [blacklistedAccounts, setBlacklistedAccounts] = useState(new Set());
   const [fraudPatterns, setFraudPatterns] = useState({
     CYCLE_DETECTED: 0,
     SMURFING: 0,
@@ -41,12 +45,69 @@ function App() {
   useEffect(() => {
     const savedUser = localStorage.getItem('fraudnets_user');
     if (savedUser) {
-      setUser(JSON.parse(savedUser));
+      const userData = JSON.parse(savedUser);
+      setUser(userData);
+
+      const savedState = localStorage.getItem(`fraudnets_state_${userData.username}`);
+      if (savedState) {
+        const state = JSON.parse(savedState);
+        setTransactions(state.transactions || []);
+        setAlerts(state.alerts || []);
+        setFraudPatterns(state.fraudPatterns || {
+          CYCLE_DETECTED: 0,
+          SMURFING: 0,
+          GNN_FLAGGED: 0,
+          STRUCTURING: 0
+        });
+        setPatternIndex(state.patternIndex || 0);
+        setBlacklistedAccounts(new Set(state.blacklisted || []));
+        setStats(state.stats || {
+          total_analyses: 0,
+          frauds_detected: 0,
+          blacklisted_count: 0,
+          current_graph_nodes: 0
+        });
+      }
     }
   }, []);
 
+  useEffect(() => {
+    if (user) {
+      const state = {
+        transactions,
+        alerts,
+        fraudPatterns,
+        patternIndex,
+        blacklisted: Array.from(blacklistedAccounts),
+        stats
+      };
+      localStorage.setItem(`fraudnets_state_${user.username}`, JSON.stringify(state));
+    }
+  }, [user, transactions, alerts, fraudPatterns, patternIndex, blacklistedAccounts, stats]);
+
   const handleLogin = (userData) => {
     setUser(userData);
+
+    const savedState = localStorage.getItem(`fraudnets_state_${userData.username}`);
+    if (!savedState) {
+      setTransactions([]);
+      setAlerts([]);
+      setFraudPatterns({
+        CYCLE_DETECTED: 0,
+        SMURFING: 0,
+        GNN_FLAGGED: 0,
+        STRUCTURING: 0
+      });
+      setPatternIndex(0);
+      setBlacklistedAccounts(new Set());
+      setStats({
+        total_analyses: 0,
+        frauds_detected: 0,
+        blacklisted_count: 0,
+        current_graph_nodes: 0
+      });
+    }
+
     showToast(`Welcome, ${userData.username}!`, 'success');
   };
 
@@ -61,6 +122,14 @@ function App() {
       GNN_FLAGGED: 0,
       STRUCTURING: 0
     });
+    setPatternIndex(0);
+    setBlacklistedAccounts(new Set());
+    setStats({
+      total_analyses: 0,
+      frauds_detected: 0,
+      blacklisted_count: 0,
+      current_graph_nodes: 0
+    });
   };
 
   const showToast = (message, type = 'success') => {
@@ -68,22 +137,28 @@ function App() {
     setTimeout(() => setToast(null), 4000);
   };
 
-  const fetchStats = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API_URL}/stats`);
-      setStats(res.data);
-    } catch (error) {
-      console.error("Error fetching stats:", error);
-    }
-  }, []);
+  const buildGraphFromTransactions = useCallback((txs, blacklisted) => {
+    const nodeMap = new Map();
+    const links = [];
 
-  const fetchGraph = useCallback(async () => {
-    try {
-      const res = await axios.get(`${API_URL}/graph`);
-      setGraphData(res.data);
-    } catch (error) {
-      console.error("Error fetching graph:", error);
-    }
+    txs.forEach(tx => {
+      if (!nodeMap.has(tx.sender)) {
+        nodeMap.set(tx.sender, { id: tx.sender, name: tx.sender, inDegree: 0, outDegree: 0 });
+      }
+      if (!nodeMap.has(tx.receiver)) {
+        nodeMap.set(tx.receiver, { id: tx.receiver, name: tx.receiver, inDegree: 0, outDegree: 0 });
+      }
+      nodeMap.get(tx.sender).outDegree += 1;
+      nodeMap.get(tx.receiver).inDegree += 1;
+      links.push({ source: tx.sender, target: tx.receiver, value: tx.amount });
+    });
+
+    const nodes = Array.from(nodeMap.values()).map(n => ({
+      ...n,
+      isBlacklisted: blacklisted.has(n.id)
+    }));
+
+    return { nodes, links };
   }, []);
 
   const simulateTraffic = async () => {
@@ -91,38 +166,57 @@ function App() {
     setIsSimulating(true);
 
     try {
-      const sampleRes = await axios.post(`${API_URL}/demo/generate-sample`);
+      const currentPattern = PATTERN_SEQUENCE[patternIndex % PATTERN_SEQUENCE.length];
+      setPatternIndex(prev => prev + 1);
+
+      const sampleRes = await axios.post(`${API_URL}/demo/generate-sample?pattern=${currentPattern}`);
       const txs = sampleRes.data.transactions;
       const pattern = sampleRes.data.pattern;
 
       const analyzeRes = await axios.post(`${API_URL}/analyze`, {
         transactions: txs,
-        bank_id: user?.sessionId || "DEMO_BANK"
+        bank_id: user?.sessionId || "DEMO_BANK",
+        expected_pattern: pattern
       });
 
       const result = analyzeRes.data;
 
-      if (result.fraud_type && result.fraud_type !== null) {
+      if (result.is_fraud && result.fraud_type) {
         setFraudPatterns(prev => ({
           ...prev,
           [result.fraud_type]: (prev[result.fraud_type] || 0) + 1
         }));
-      }
 
-      if (result.is_fraud) {
         const newAlert = {
           id: Date.now(),
           type: result.fraud_type,
-          message: `${result.fraud_type.replace('_', ' ')} detected - ${result.flagged_accounts.length} account(s) blacklisted`,
+          message: `${result.fraud_type.replace(/_/g, ' ')} - ${result.flagged_accounts.length} account(s) blacklisted`,
           accounts: result.flagged_accounts,
           timestamp: new Date().toISOString(),
           severity: result.fraud_type === 'CYCLE_DETECTED' ? 'high' : 'medium'
         };
         setAlerts(prev => [newAlert, ...prev].slice(0, 10));
 
-        showToast(`🚨 ${result.fraud_type.replace('_', ' ')}: ${result.flagged_accounts.length} account(s) permanently blacklisted!`, 'warning');
+        setBlacklistedAccounts(prev => {
+          const newSet = new Set(prev);
+          result.flagged_accounts.forEach(acc => newSet.add(acc));
+          return newSet;
+        });
+
+        showToast(`🚨 ${result.fraud_type.replace(/_/g, ' ')}: ${result.flagged_accounts.length} account(s) permanently blacklisted!`, 'warning');
+
+        setStats(prev => ({
+          ...prev,
+          total_analyses: prev.total_analyses + 1,
+          frauds_detected: prev.frauds_detected + 1,
+          blacklisted_count: prev.blacklisted_count + result.flagged_accounts.length
+        }));
       } else {
         showToast(`✓ ${txs.length} valid transaction(s) processed`, 'success');
+        setStats(prev => ({
+          ...prev,
+          total_analyses: prev.total_analyses + 1
+        }));
       }
 
       const newTxs = txs.map(tx => ({
@@ -132,13 +226,17 @@ function App() {
         timestamp: tx.timestamp || new Date().toISOString()
       }));
 
-      setTransactions(prev => [...newTxs, ...prev].slice(0, 100));
-      await fetchStats();
-      await fetchGraph();
+      setTransactions(prev => {
+        const updated = [...newTxs, ...prev].slice(0, 100);
+        const graph = buildGraphFromTransactions(updated, blacklistedAccounts);
+        setGraphData(graph);
+        setStats(s => ({ ...s, current_graph_nodes: graph.nodes.length }));
+        return updated;
+      });
 
     } catch (error) {
       console.error("Simulation error:", error);
-      showToast('Failed to run simulation', 'error');
+      showToast('Failed to run simulation. Check if backend is running.', 'error');
     } finally {
       setIsSimulating(false);
     }
@@ -147,13 +245,22 @@ function App() {
   const handleClearHistory = () => {
     setTransactions([]);
     setAlerts([]);
+    setGraphData({ nodes: [], links: [] });
     setFraudPatterns({
       CYCLE_DETECTED: 0,
       SMURFING: 0,
       GNN_FLAGGED: 0,
       STRUCTURING: 0
     });
-    showToast('History cleared', 'success');
+    setPatternIndex(0);
+    setBlacklistedAccounts(new Set());
+    setStats({
+      total_analyses: 0,
+      frauds_detected: 0,
+      blacklisted_count: 0,
+      current_graph_nodes: 0
+    });
+    showToast('All data cleared', 'success');
   };
 
   const handleExportHistory = () => {
@@ -187,19 +294,11 @@ function App() {
   };
 
   useEffect(() => {
-    if (!user) return;
-
-    fetchStats();
-    fetchGraph();
-
-    if (settings.autoRefresh) {
-      const interval = setInterval(() => {
-        fetchStats();
-        fetchGraph();
-      }, settings.refreshInterval * 1000);
-      return () => clearInterval(interval);
+    if (transactions.length > 0) {
+      const graph = buildGraphFromTransactions(transactions, blacklistedAccounts);
+      setGraphData(graph);
     }
-  }, [user, fetchStats, fetchGraph, settings.autoRefresh, settings.refreshInterval]);
+  }, [blacklistedAccounts, buildGraphFromTransactions]);
 
   const riskScore = stats.total_analyses > 0
     ? Math.round((stats.frauds_detected / stats.total_analyses) * 100)
@@ -299,7 +398,7 @@ function App() {
             <button
               onClick={toggleTheme}
               className="btn btn-icon"
-              title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              title={theme === 'dark' ? 'Light Mode' : 'Dark Mode'}
             >
               {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
             </button>
@@ -359,11 +458,9 @@ function App() {
             <div className="card" style={{ height: '420px' }}>
               <div className="card-header">
                 <span className="card-title">Network Topology</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                  <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                    {graphData.nodes.length} nodes · {graphData.links.length} edges
-                  </span>
-                </div>
+                <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                  {graphData.nodes.length} nodes · {graphData.links.length} edges
+                </span>
               </div>
               <div style={{ height: 'calc(100% - 49px)' }}>
                 <GraphView graphData={graphData} />
