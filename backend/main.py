@@ -3,8 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import networkx as nx
-from datetime import datetime
+from datetime import datetime, timedelta
 import random
+import string
 import os
 from dotenv import load_dotenv
 
@@ -64,6 +65,27 @@ stats = {
 }
 blacklisted_accounts = set()
 gnn_model = None
+
+FIRST_NAMES = ["James", "Emma", "Liam", "Olivia", "Noah", "Ava", "William", "Sophia", "Benjamin", "Isabella",
+               "Lucas", "Mia", "Henry", "Charlotte", "Alexander", "Amelia", "Sebastian", "Harper", "Jack", "Evelyn",
+               "Michael", "Sarah", "David", "Jennifer", "Robert", "Lisa", "Daniel", "Nancy", "Matthew", "Karen"]
+LAST_NAMES = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+              "Anderson", "Taylor", "Thomas", "Moore", "Jackson", "Martin", "Lee", "Thompson", "White", "Harris"]
+BANK_CODES = ["HDFC", "ICICI", "SBI", "AXIS", "BOA", "CHASE", "CITI", "WELLS", "HSBC", "BARCLAYS"]
+
+def generate_account_id():
+    bank = random.choice(BANK_CODES)
+    number = ''.join(random.choices(string.digits, k=10))
+    return f"{bank}-{number}"
+
+def generate_realistic_name():
+    return f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
+
+def generate_tx_id():
+    prefix = random.choice(["TXN", "PAY", "TRF", "WIR"])
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"{prefix}-{timestamp}-{suffix}"
 
 class BlockchainService:
     def __init__(self):
@@ -146,15 +168,32 @@ def detect_smurfing(transactions: List[Transaction], threshold: float = 10000) -
     sender_totals = {}
     for tx in transactions:
         if tx.sender not in sender_totals:
-            sender_totals[tx.sender] = {"count": 0, "total": 0}
+            sender_totals[tx.sender] = {"count": 0, "total": 0, "amounts": []}
         sender_totals[tx.sender]["count"] += 1
         sender_totals[tx.sender]["total"] += tx.amount
+        sender_totals[tx.sender]["amounts"].append(tx.amount)
     
     flagged = []
     for sender, data in sender_totals.items():
-        if data["count"] >= 3 and data["total"] >= threshold * 0.8:
-            avg = data["total"] / data["count"]
-            if avg < threshold:
+        if data["count"] >= 3:
+            avg_amount = data["total"] / data["count"]
+            if avg_amount < threshold and data["total"] >= threshold * 0.7:
+                if all(amt < threshold for amt in data["amounts"]):
+                    flagged.append(sender)
+    return flagged
+
+def detect_structuring(transactions: List[Transaction], threshold: float = 10000) -> List[str]:
+    sender_data = {}
+    for tx in transactions:
+        if tx.sender not in sender_data:
+            sender_data[tx.sender] = []
+        sender_data[tx.sender].append(tx.amount)
+    
+    flagged = []
+    for sender, amounts in sender_data.items():
+        if len(amounts) >= 2:
+            just_under = [amt for amt in amounts if threshold * 0.85 <= amt < threshold]
+            if len(just_under) >= 2:
                 flagged.append(sender)
     return flagged
 
@@ -163,9 +202,13 @@ def calculate_risk_scores(graph: nx.DiGraph, flagged: List[str]) -> Dict[str, fl
     for node in graph.nodes():
         in_deg = graph.in_degree(node)
         out_deg = graph.out_degree(node)
-        base_score = min((in_deg + out_deg) / 10, 0.5)
+        base_score = min((in_deg + out_deg) / 10, 0.4)
+        
         if node in flagged:
-            base_score += 0.4
+            base_score += 0.5
+        if node in blacklisted_accounts:
+            base_score = 1.0
+            
         scores[node] = min(base_score, 1.0)
     return scores
 
@@ -180,7 +223,7 @@ async def startup_event():
             model_path = "fraud_gnn_model.pth"
             if os.path.exists(model_path):
                 gnn_model = FraudGNN(in_channels=4, hidden_channels=16, out_channels=2)
-                gnn_model.load_state_dict(torch.load(model_path))
+                gnn_model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
                 gnn_model.eval()
                 print("GNN model loaded from file")
             else:
@@ -191,6 +234,10 @@ async def startup_event():
                 print("GNN model trained and saved")
         except Exception as e:
             print(f"GNN initialization error: {e}")
+
+@app.get("/")
+async def root():
+    return {"message": "FraudNets API", "version": "1.0.0", "status": "running"}
 
 @app.get("/health")
 async def health_check():
@@ -262,19 +309,26 @@ async def analyze_transactions(request: AnalyzeRequest):
             fraud_type = "SMURFING"
             flagged_accounts.extend(smurfers)
     
+    if not is_fraud:
+        structurers = detect_structuring(request.transactions)
+        if structurers:
+            is_fraud = True
+            fraud_type = "STRUCTURING"
+            flagged_accounts.extend(structurers)
+    
     if not is_fraud and GNN_AVAILABLE and gnn_model is not None:
         try:
-            data = generate_training_data(
-                num_nodes=transaction_graph.number_of_nodes() or 10,
-                num_edges=transaction_graph.number_of_edges() or 20
-            )
+            num_nodes = max(transaction_graph.number_of_nodes(), 10)
+            num_edges = max(transaction_graph.number_of_edges(), 20)
+            data = generate_training_data(num_nodes=num_nodes, num_edges=num_edges)
             predictions = predict_fraud(gnn_model, data)
             fraud_nodes = (predictions == 1).nonzero(as_tuple=True)[0].tolist()
-            if fraud_nodes:
+            
+            if fraud_nodes and len(fraud_nodes) <= num_nodes * 0.3:
                 is_fraud = True
                 fraud_type = "GNN_FLAGGED"
                 node_list = list(transaction_graph.nodes())
-                for idx in fraud_nodes:
+                for idx in fraud_nodes[:3]:
                     if idx < len(node_list):
                         flagged_accounts.append(node_list[idx])
         except Exception as e:
@@ -287,12 +341,12 @@ async def analyze_transactions(request: AnalyzeRequest):
     if is_fraud and flagged_accounts:
         for account in flagged_accounts:
             blacklisted_accounts.add(account)
+            stats["blacklisted_count"] += 1
             import hashlib
             account_hash = hashlib.sha256(account.encode()).hexdigest()
             tx_hash = blockchain_service.blacklist_account(account_hash)
-            if tx_hash:
+            if tx_hash and not blockchain_tx:
                 blockchain_tx = tx_hash
-                stats["blacklisted_count"] += 1
     
     stats["total_analyses"] += 1
     if is_fraud:
@@ -309,49 +363,118 @@ async def analyze_transactions(request: AnalyzeRequest):
 
 @app.post("/demo/generate-sample")
 async def generate_sample():
-    patterns = ["normal", "cycle", "smurf"]
+    patterns = ["normal", "normal", "cycle", "smurf", "structuring", "mixed"]
     pattern = random.choice(patterns)
     
     transactions = []
+    base_time = datetime.now()
     
     if pattern == "cycle":
-        participants = ["Cycle_A", "Cycle_B", "Cycle_C"]
-        amount = random.randint(5000, 15000)
-        for i in range(len(participants)):
+        num_participants = random.randint(3, 5)
+        participants = [generate_realistic_name() for _ in range(num_participants)]
+        amount = random.randint(15000, 50000)
+        
+        for i in range(num_participants):
+            tx_time = base_time + timedelta(minutes=i*random.randint(5, 30))
             transactions.append(Transaction(
-                tx_id=f"TX_CYCLE_{i}",
+                tx_id=generate_tx_id(),
                 sender=participants[i],
-                receiver=participants[(i + 1) % len(participants)],
-                amount=amount,
-                timestamp=datetime.now().isoformat()
+                receiver=participants[(i + 1) % num_participants],
+                amount=amount + random.randint(-500, 500),
+                timestamp=tx_time.isoformat()
             ))
+            
     elif pattern == "smurf":
-        master = f"Smurf_Master_{random.randint(1, 100)}"
-        for i in range(5):
+        master = generate_realistic_name()
+        num_mules = random.randint(4, 7)
+        mules = [generate_realistic_name() for _ in range(num_mules)]
+        
+        for i, mule in enumerate(mules):
+            tx_time = base_time + timedelta(minutes=i*random.randint(2, 10))
+            amount = random.randint(8000, 9800)
             transactions.append(Transaction(
-                tx_id=f"TX_SMURF_{i}",
+                tx_id=generate_tx_id(),
                 sender=master,
-                receiver=f"Mule_{random.randint(1, 50)}",
-                amount=random.randint(8000, 9500),
-                timestamp=datetime.now().isoformat()
+                receiver=mule,
+                amount=amount,
+                timestamp=tx_time.isoformat()
             ))
-    else:
-        names = ["Alice", "Bob", "Charlie", "David", "Eve"]
-        for i in range(random.randint(2, 4)):
-            sender, receiver = random.sample(names, 2)
+            
+    elif pattern == "structuring":
+        sender = generate_realistic_name()
+        receiver = generate_realistic_name()
+        num_txs = random.randint(3, 5)
+        
+        for i in range(num_txs):
+            tx_time = base_time + timedelta(hours=i*random.randint(1, 4))
+            amount = random.randint(9000, 9900)
             transactions.append(Transaction(
-                tx_id=f"TX_NORMAL_{i}",
+                tx_id=generate_tx_id(),
                 sender=sender,
                 receiver=receiver,
-                amount=random.randint(100, 1000),
-                timestamp=datetime.now().isoformat()
+                amount=amount,
+                timestamp=tx_time.isoformat()
+            ))
+            
+    elif pattern == "mixed":
+        people = [generate_realistic_name() for _ in range(6)]
+        num_txs = random.randint(4, 8)
+        
+        for i in range(num_txs):
+            sender, receiver = random.sample(people, 2)
+            tx_time = base_time + timedelta(minutes=i*random.randint(10, 60))
+            amount = random.choice([
+                random.randint(100, 2000),
+                random.randint(5000, 15000),
+                random.randint(9000, 9900),
+            ])
+            transactions.append(Transaction(
+                tx_id=generate_tx_id(),
+                sender=sender,
+                receiver=receiver,
+                amount=amount,
+                timestamp=tx_time.isoformat()
+            ))
+    else:
+        people = [generate_realistic_name() for _ in range(5)]
+        num_txs = random.randint(2, 5)
+        
+        for i in range(num_txs):
+            sender, receiver = random.sample(people, 2)
+            tx_time = base_time + timedelta(minutes=i*random.randint(30, 120))
+            amount = random.choice([
+                random.randint(50, 500),
+                random.randint(500, 2000),
+                random.randint(1000, 5000),
+            ])
+            transactions.append(Transaction(
+                tx_id=generate_tx_id(),
+                sender=sender,
+                receiver=receiver,
+                amount=amount,
+                timestamp=tx_time.isoformat()
             ))
     
     return {"transactions": transactions, "pattern": pattern}
 
 @app.get("/blacklist")
 async def get_blacklist():
-    return {"blacklisted_accounts": list(blacklisted_accounts)}
+    return {
+        "blacklisted_accounts": list(blacklisted_accounts),
+        "total_count": len(blacklisted_accounts)
+    }
+
+@app.delete("/reset")
+async def reset_system():
+    global stats, blacklisted_accounts, transaction_graph
+    transaction_graph = nx.DiGraph()
+    blacklisted_accounts = set()
+    stats = {
+        "total_analyses": 0,
+        "frauds_detected": 0,
+        "blacklisted_count": 0
+    }
+    return {"message": "System reset successfully"}
 
 if __name__ == "__main__":
     import uvicorn
