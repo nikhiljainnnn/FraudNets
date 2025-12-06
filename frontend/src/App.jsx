@@ -10,7 +10,7 @@ import FraudPatterns from './components/FraudPatterns';
 import AlertsPanel from './components/AlertsPanel';
 import SettingsModal from './components/SettingsModal';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://fraudnets.onrender.com';
 
 function App() {
   const { theme, toggleTheme, settings } = useTheme();
