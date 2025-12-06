@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
-import { Activity, Shield, AlertTriangle, Network, Clock, Zap, Settings, Sun, Moon } from 'lucide-react';
+import { Activity, Shield, AlertTriangle, Network, Clock, Zap, Settings, Sun, Moon, LogOut } from 'lucide-react';
 import { useTheme } from './context/ThemeContext';
 import StatsCard from './components/StatsCard';
 import TransactionFeed from './components/TransactionFeed';
@@ -9,12 +9,16 @@ import RiskMeter from './components/RiskMeter';
 import FraudPatterns from './components/FraudPatterns';
 import AlertsPanel from './components/AlertsPanel';
 import SettingsModal from './components/SettingsModal';
+import LoginPage from './components/LoginPage';
+import Toast from './components/Toast';
 
 const API_URL = 'https://fraudnets.onrender.com';
 
 function App() {
   const { theme, toggleTheme, settings } = useTheme();
   const [showSettings, setShowSettings] = useState(false);
+  const [user, setUser] = useState(null);
+  const [toast, setToast] = useState(null);
 
   const [stats, setStats] = useState({
     total_analyses: 0,
@@ -33,6 +37,36 @@ function App() {
     GNN_FLAGGED: 0,
     STRUCTURING: 0
   });
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem('fraudnets_user');
+    if (savedUser) {
+      setUser(JSON.parse(savedUser));
+    }
+  }, []);
+
+  const handleLogin = (userData) => {
+    setUser(userData);
+    showToast(`Welcome, ${userData.username}!`, 'success');
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('fraudnets_user');
+    setUser(null);
+    setTransactions([]);
+    setAlerts([]);
+    setFraudPatterns({
+      CYCLE_DETECTED: 0,
+      SMURFING: 0,
+      GNN_FLAGGED: 0,
+      STRUCTURING: 0
+    });
+  };
+
+  const showToast = (message, type = 'success') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  };
 
   const fetchStats = useCallback(async () => {
     try {
@@ -59,15 +93,16 @@ function App() {
     try {
       const sampleRes = await axios.post(`${API_URL}/demo/generate-sample`);
       const txs = sampleRes.data.transactions;
+      const pattern = sampleRes.data.pattern;
 
       const analyzeRes = await axios.post(`${API_URL}/analyze`, {
         transactions: txs,
-        bank_id: "DEMO_BANK"
+        bank_id: user?.sessionId || "DEMO_BANK"
       });
 
       const result = analyzeRes.data;
 
-      if (result.fraud_type) {
+      if (result.fraud_type && result.fraud_type !== null) {
         setFraudPatterns(prev => ({
           ...prev,
           [result.fraud_type]: (prev[result.fraud_type] || 0) + 1
@@ -78,19 +113,23 @@ function App() {
         const newAlert = {
           id: Date.now(),
           type: result.fraud_type,
-          message: `${result.fraud_type} detected involving ${result.flagged_accounts.length} accounts`,
+          message: `${result.fraud_type.replace('_', ' ')} detected - ${result.flagged_accounts.length} account(s) blacklisted`,
           accounts: result.flagged_accounts,
           timestamp: new Date().toISOString(),
           severity: result.fraud_type === 'CYCLE_DETECTED' ? 'high' : 'medium'
         };
         setAlerts(prev => [newAlert, ...prev].slice(0, 10));
+
+        showToast(`🚨 ${result.fraud_type.replace('_', ' ')}: ${result.flagged_accounts.length} account(s) permanently blacklisted!`, 'warning');
+      } else {
+        showToast(`✓ ${txs.length} valid transaction(s) processed`, 'success');
       }
 
       const newTxs = txs.map(tx => ({
         ...tx,
-        is_fraud: result.flagged_accounts.includes(tx.sender) || result.flagged_accounts.includes(tx.receiver),
-        fraud_type: result.fraud_type,
-        timestamp: new Date().toISOString()
+        is_fraud: result.flagged_accounts?.includes(tx.sender) || result.flagged_accounts?.includes(tx.receiver),
+        fraud_type: result.is_fraud ? result.fraud_type : null,
+        timestamp: tx.timestamp || new Date().toISOString()
       }));
 
       setTransactions(prev => [...newTxs, ...prev].slice(0, 100));
@@ -99,6 +138,7 @@ function App() {
 
     } catch (error) {
       console.error("Simulation error:", error);
+      showToast('Failed to run simulation', 'error');
     } finally {
       setIsSimulating(false);
     }
@@ -113,20 +153,25 @@ function App() {
       GNN_FLAGGED: 0,
       STRUCTURING: 0
     });
+    showToast('History cleared', 'success');
   };
 
   const handleExportHistory = () => {
-    if (transactions.length === 0) return;
+    if (transactions.length === 0) {
+      showToast('No transactions to export', 'error');
+      return;
+    }
 
-    const headers = ['Sender', 'Receiver', 'Amount', 'Fraud', 'Type', 'Timestamp'];
+    const headers = ['TX_ID', 'Sender', 'Receiver', 'Amount', 'Fraud', 'Type', 'Timestamp'];
     const csvContent = [
       headers.join(','),
       ...transactions.map(tx => [
+        tx.tx_id || '',
         tx.sender,
         tx.receiver,
         tx.amount,
         tx.is_fraud ? 'Yes' : 'No',
-        tx.fraud_type || 'N/A',
+        tx.fraud_type || 'VALID',
         tx.timestamp || ''
       ].join(','))
     ].join('\n');
@@ -135,12 +180,15 @@ function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `fraudnets_history_${new Date().toISOString().split('T')[0]}.csv`;
+    a.download = `fraudnets_${user?.username || 'export'}_${new Date().toISOString().split('T')[0]}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+    showToast('Exported successfully', 'success');
   };
 
   useEffect(() => {
+    if (!user) return;
+
     fetchStats();
     fetchGraph();
 
@@ -151,7 +199,7 @@ function App() {
       }, settings.refreshInterval * 1000);
       return () => clearInterval(interval);
     }
-  }, [fetchStats, fetchGraph, settings.autoRefresh, settings.refreshInterval]);
+  }, [user, fetchStats, fetchGraph, settings.autoRefresh, settings.refreshInterval]);
 
   const riskScore = stats.total_analyses > 0
     ? Math.round((stats.frauds_detected / stats.total_analyses) * 100)
@@ -161,8 +209,20 @@ function App() {
     ? ((stats.frauds_detected / stats.total_analyses) * 100).toFixed(1)
     : 0;
 
+  if (!user) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
+
   return (
     <div className="min-h-screen" style={{ background: 'var(--bg-primary)' }}>
+      {toast && (
+        <Toast
+          message={toast.message}
+          type={toast.type}
+          onClose={() => setToast(null)}
+        />
+      )}
+
       <header style={{
         borderBottom: '1px solid var(--border-primary)',
         background: 'var(--bg-secondary)'
@@ -194,6 +254,19 @@ function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 12px',
+              background: 'var(--bg-tertiary)',
+              borderRadius: '6px',
+              fontSize: '12px',
+              color: 'var(--text-secondary)'
+            }}>
+              <span>👤 {user.username}</span>
+            </div>
+
             <div style={{
               display: 'flex',
               alignItems: 'center',
@@ -238,6 +311,15 @@ function App() {
             >
               <Settings size={18} />
             </button>
+
+            <button
+              onClick={handleLogout}
+              className="btn btn-icon"
+              title="Logout"
+              style={{ color: 'var(--accent-red)' }}
+            >
+              <LogOut size={18} />
+            </button>
           </div>
         </div>
       </header>
@@ -261,7 +343,7 @@ function App() {
             label="Blacklisted"
             value={stats.blacklisted_count}
             icon={Shield}
-            trend="On-chain"
+            trend="Permanent"
           />
           <StatsCard
             label="Network Nodes"
