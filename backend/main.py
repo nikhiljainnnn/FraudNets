@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import networkx as nx
 from datetime import datetime
 import random
@@ -9,6 +9,23 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+
+try:
+    import torch
+    from gnn_model import FraudGNN, train_model, predict_fraud
+    from data_loader import generate_training_data
+    GNN_AVAILABLE = True
+except ImportError:
+    GNN_AVAILABLE = False
+    print("Warning: PyTorch/GNN not available. Running in limited mode.")
+
+try:
+    from web3 import Web3
+    from web3.middleware import geth_poa_middleware
+    WEB3_AVAILABLE = True
+except ImportError:
+    WEB3_AVAILABLE = False
+    print("Warning: Web3 not available. Blockchain features disabled.")
 
 app = FastAPI(title="FraudNets API", version="1.0.0")
 
@@ -46,6 +63,77 @@ stats = {
     "blacklisted_count": 0
 }
 blacklisted_accounts = set()
+gnn_model = None
+
+class BlockchainService:
+    def __init__(self):
+        self.web3 = None
+        self.contract = None
+        self.account = None
+        
+    def initialize(self):
+        if not WEB3_AVAILABLE:
+            return False
+            
+        ganache_url = os.getenv("GANACHE_URL")
+        contract_address = os.getenv("CONTRACT_ADDRESS")
+        private_key = os.getenv("PRIVATE_KEY")
+        
+        if not all([ganache_url, contract_address, private_key]):
+            return False
+            
+        try:
+            self.web3 = Web3(Web3.HTTPProvider(ganache_url))
+            self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+            
+            contract_abi = [
+                {
+                    "inputs": [{"name": "account", "type": "address"}],
+                    "name": "blacklistAccount",
+                    "outputs": [],
+                    "stateMutability": "nonpayable",
+                    "type": "function"
+                },
+                {
+                    "inputs": [{"name": "account", "type": "address"}],
+                    "name": "isBlacklisted",
+                    "outputs": [{"name": "", "type": "bool"}],
+                    "stateMutability": "view",
+                    "type": "function"
+                }
+            ]
+            
+            self.contract = self.web3.eth.contract(
+                address=Web3.to_checksum_address(contract_address),
+                abi=contract_abi
+            )
+            self.account = self.web3.eth.account.from_key(private_key)
+            return self.web3.is_connected()
+        except Exception as e:
+            print(f"Blockchain init error: {e}")
+            return False
+    
+    def blacklist_account(self, account_hash: str) -> Optional[str]:
+        if not self.contract or not self.account:
+            return None
+        try:
+            dummy_address = Web3.to_checksum_address(
+                "0x" + account_hash[:40].ljust(40, '0')
+            )
+            tx = self.contract.functions.blacklistAccount(dummy_address).build_transaction({
+                'from': self.account.address,
+                'nonce': self.web3.eth.get_transaction_count(self.account.address),
+                'gas': 200000,
+                'gasPrice': self.web3.eth.gas_price
+            })
+            signed_tx = self.web3.eth.account.sign_transaction(tx, self.account.key)
+            tx_hash = self.web3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            return tx_hash.hex()
+        except Exception as e:
+            print(f"Blacklist error: {e}")
+            return None
+
+blockchain_service = BlockchainService()
 
 def detect_cycles(graph: nx.DiGraph) -> List[List[str]]:
     try:
@@ -81,16 +169,39 @@ def calculate_risk_scores(graph: nx.DiGraph, flagged: List[str]) -> Dict[str, fl
         scores[node] = min(base_score, 1.0)
     return scores
 
-@app.get("/")
-async def root():
-    return {"message": "FraudNets API is running", "version": "1.0.0"}
+@app.on_event("startup")
+async def startup_event():
+    global gnn_model
+    
+    blockchain_service.initialize()
+    
+    if GNN_AVAILABLE:
+        try:
+            model_path = "fraud_gnn_model.pth"
+            if os.path.exists(model_path):
+                gnn_model = FraudGNN(in_channels=4, hidden_channels=16, out_channels=2)
+                gnn_model.load_state_dict(torch.load(model_path))
+                gnn_model.eval()
+                print("GNN model loaded from file")
+            else:
+                print("Training new GNN model...")
+                data = generate_training_data(num_nodes=100, num_edges=300)
+                gnn_model = train_model(data, epochs=100)
+                torch.save(gnn_model.state_dict(), model_path)
+                print("GNN model trained and saved")
+        except Exception as e:
+            print(f"GNN initialization error: {e}")
 
 @app.get("/health")
 async def health_check():
     return {
         "api": "healthy",
-        "blockchain": {"connected": False},
-        "gnn": {"loaded": False, "note": "Using algorithmic detection"}
+        "blockchain": {
+            "connected": blockchain_service.web3.is_connected() if blockchain_service.web3 else False
+        },
+        "gnn": {
+            "loaded": gnn_model is not None
+        }
     }
 
 @app.get("/stats")
@@ -151,12 +262,37 @@ async def analyze_transactions(request: AnalyzeRequest):
             fraud_type = "SMURFING"
             flagged_accounts.extend(smurfers)
     
+    if not is_fraud and GNN_AVAILABLE and gnn_model is not None:
+        try:
+            data = generate_training_data(
+                num_nodes=transaction_graph.number_of_nodes() or 10,
+                num_edges=transaction_graph.number_of_edges() or 20
+            )
+            predictions = predict_fraud(gnn_model, data)
+            fraud_nodes = (predictions == 1).nonzero(as_tuple=True)[0].tolist()
+            if fraud_nodes:
+                is_fraud = True
+                fraud_type = "GNN_FLAGGED"
+                node_list = list(transaction_graph.nodes())
+                for idx in fraud_nodes:
+                    if idx < len(node_list):
+                        flagged_accounts.append(node_list[idx])
+        except Exception as e:
+            print(f"GNN prediction error: {e}")
+    
     flagged_accounts = list(set(flagged_accounts))
     risk_scores = calculate_risk_scores(transaction_graph, flagged_accounts)
     
+    blockchain_tx = None
     if is_fraud and flagged_accounts:
         for account in flagged_accounts:
             blacklisted_accounts.add(account)
+            import hashlib
+            account_hash = hashlib.sha256(account.encode()).hexdigest()
+            tx_hash = blockchain_service.blacklist_account(account_hash)
+            if tx_hash:
+                blockchain_tx = tx_hash
+                stats["blacklisted_count"] += 1
     
     stats["total_analyses"] += 1
     if is_fraud:
@@ -167,7 +303,7 @@ async def analyze_transactions(request: AnalyzeRequest):
         fraud_type=fraud_type,
         flagged_accounts=flagged_accounts,
         risk_scores=risk_scores,
-        blockchain_tx_hash=None,
+        blockchain_tx_hash=blockchain_tx,
         timestamp=datetime.now().isoformat()
     )
 
